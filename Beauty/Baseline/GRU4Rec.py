@@ -1,0 +1,290 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from torch.autograd import Variable
+import torch.nn.functional as F
+import pandas as pd
+import json
+import numpy as np
+from info_nce import InfoNCE
+import matplotlib.pyplot as plt
+
+device = torch.device('cuda')
+
+class GRU4Rec(nn.Module):
+    def __init__(self, embedding_dim, hidden_dim=128, num_layers=2, num_items=0):
+        super(GRU4Rec, self).__init__()
+        assert num_items > 100, "num_items is too small, please check the mapping dictionary or data"
+        self.embedding = nn.Embedding(num_items, embedding_dim)
+        self.gru = nn.GRU(embedding_dim, hidden_dim, num_layers, batch_first=True) 
+        self.act = nn.Tanh()
+        self.fc = nn.Linear(hidden_dim, num_items) 
+        self.l1 = nn.Linear(4096, hidden_dim, bias=False)
+        self.l2 = nn.Linear(4096, hidden_dim, bias=False)
+        self.decoder = nn.Linear(hidden_dim, embedding_dim)
+
+
+    def forward(self, x):
+
+        out, h_n = self.gru(x) 
+        output_tensor, _ = torch.max(out, dim=1)
+
+        logit = self.fc(out[:, -1, :])                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    
+        logit = self.act(logit) 
+        return logit, out, output_tensor 
+
+class SampledCrossEntropyLoss(nn.Module):
+    def __init__(self, use_cuda):
+        super(SampledCrossEntropyLoss, self).__init__()
+        self.xe_loss = nn.CrossEntropyLoss()
+        self.use_cuda = use_cuda
+
+    def forward(self, logit):
+        batch_size = logit.size(1)
+        target = Variable(torch.arange(batch_size).long()).to(device)
+        return self.xe_loss(logit, target)
+
+
+def pad_to_length(seq, length=31):
+    if len(seq) < length:
+        return [0]*(length - len(seq)) + seq
+    else:
+        return seq[-length:] 
+
+
+def prepare_data(file_path):
+    users = []
+    inputs = []
+    inputs_cnt = []
+    labels = []
+    import json
+    with open(file_path) as f:
+        source_data = json.load(f)
+    for key in source_data.keys():
+        items = source_data[key][:-1]
+
+        e_inputs = items[:-1]
+        e_label = items[-1]
+        users.append(key)
+        inputs.append(pad_to_length(e_inputs,31))
+        inputs_cnt.append(len(e_inputs))
+        labels.append(e_label)
+    return users,inputs,inputs_cnt,labels
+
+def get_interests(u, icnt, semantic_long, semantic_short):
+
+    user_keys = [f"user{str(au.item())}" for au in u]
+
+    long_4096 = torch.concat([semantic_long[user_key].unsqueeze(0).to(device) for user_key in user_keys],dim=0)
+    long_int = model.l2(long_4096)
+    short_ints = []
+    for xx,user_key in enumerate(user_keys):
+        short_ints += [b.to(device).unsqueeze(0) for b in semantic_short[user_key]]
+    short_ints = torch.concat(short_ints,dim=0)
+
+    short_ints = model.l1(short_ints)    
+    return short_ints, long_int
+
+def gumbel_sigmoid(logits, tau=1.0, hard=False):
+    eps = 1e-10
+    U = torch.rand_like(logits)
+    g = -torch.log(-torch.log(U + eps) + eps)
+    y = logits + g
+    y = (y / tau).sigmoid()
+    if hard:
+        y_hard = (y > 0.5).float()
+        y = (y_hard - y).detach() + y
+    return y
+
+def tensor_to_list(tensor):
+    if isinstance(tensor, torch.Tensor):
+        return tensor.cpu().detach().numpy().tolist()
+    elif isinstance(tensor, np.ndarray):
+        return tensor.tolist()
+    return tensor
+
+if __name__ == "__main__":
+    file_path = 'XXX'
+    users,inputs,inputs_cnt,labels = prepare_data(file_path)
+
+    users = torch.tensor([int(u[4:]) for u in users])
+    inputs = torch.tensor(inputs, dtype=torch.long)
+    inputs_cnt = torch.tensor(inputs_cnt, dtype=torch.long)
+    labels = torch.tensor(labels, dtype=torch.long)
+
+    num_items = 12102
+
+    dataset = TensorDataset(users,inputs,inputs_cnt,labels)
+    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+    model = GRU4Rec(embedding_dim=64, hidden_dim=128, num_layers=2, num_items=num_items).to(device)
+    criterion = SampledCrossEntropyLoss(use_cuda=True)
+    optimizer = optim.Adam(model.parameters(), lr=0.00001)
+
+    num_epochs = 1000
+    losses = []
+    patience = 10
+    no_improvement_epochs = 0
+    all_long_interest = []
+    all_short_interest = []
+    semantic_long = torch.load('../semantic_long.pt') 
+    semantic_short = torch.load('../semantic_short.pt')
+    infonce = InfoNCE()
+
+    user_mask_probs = {}
+    denoised_sequences = {}
+    best_denoised_sequences = {} 
+    best_loss = np.inf 
+    best_epoch = -1
+    best_mask_probs = {}
+    print("---------------begin training------------")
+    model.train()
+
+    for epoch in range(num_epochs):
+        total_loss = 0
+
+        epoch_mask_probs = {}
+        mask_probs_dict = {}
+
+        for u,x,icnt,y in dataloader:
+            inputs = x.to(device)
+            target = y.to(device)
+            icnt = icnt.to(device)
+            u    = u.to(device)
+
+            modified_inputs_embedded = []
+            for i, user_id in enumerate(u):
+                user_id_str = f"user{user_id.item()}"
+                original_embedding = model.embedding(inputs[i])
+
+                if epoch > 0 and user_id_str in mask_probs_dict:
+                    mask_prob = mask_probs_dict[user_id_str]
+                    
+                    if mask_prob.size(0) == original_embedding.size(0):
+                        masked_embedding = original_embedding * mask_prob.unsqueeze(-1)
+                        modified_inputs_embedded.append(masked_embedding.unsqueeze(0))
+                    else:
+                        modified_inputs_embedded.append(original_embedding.unsqueeze(0))
+                else:
+                    modified_inputs_embedded.append(original_embedding.unsqueeze(0))
+
+            inputs_embedded = torch.cat(modified_inputs_embedded, dim=0)
+
+            optimizer.zero_grad()
+
+            short_int, long_int = get_interests(u, icnt, semantic_long, semantic_short)
+            logit, out, h_n = model(inputs_embedded)
+
+            logit_sampled = logit[:, target.view(-1)]
+            loss = criterion(logit_sampled) 
+
+            gru_short_int = []
+            for i,ic in enumerate(icnt):
+                gru_short_int.append(out[i,-ic:,:])
+            gru_short_int = torch.concat(gru_short_int,0)
+            if short_int.shape[0] > gru_short_int.shape[0]:
+                short_int = short_int[-gru_short_int.shape[0]: , :]
+
+            gru_long_int = h_n
+            loss += infonce(gru_short_int, short_int.to(device)) + infonce(gru_long_int, long_int.to(device))
+
+            cos_sim = F.cosine_similarity(gru_long_int, long_int, dim=-1)
+            mask = cos_sim >= -1.0
+            gru_slices, short_slices = [], []
+            start_g, start_s = 0, 0
+
+            for i_user in range(inputs.size(0)):
+                length_i = icnt[i_user].item()
+                g_slice = out[i_user, -length_i:, :]
+
+                if g_slice.size(0) > 31:
+                    g_slice = g_slice[-31:, :] 
+
+                s_slice = short_int[start_s:start_s+length_i, :]
+                if s_slice.size(0) > 31:
+                    s_slice = s_slice[-31:, :] 
+                
+                min_len = min(g_slice.size(0), s_slice.size(0))
+                g_slice = g_slice[-min_len:, :]
+                s_slice = s_slice[-min_len:, :]
+
+                gru_slices.append(g_slice)
+                short_slices.append(s_slice)
+                start_s += min_len
+
+            mse_loss_total = 0.0
+            masked_users_count = 0
+
+            for i_user in range(inputs.size(0)):
+                user_id = u[i_user].item()
+                user_id_str = f"user{user_id}"
+
+                if mask[i_user]:
+                    masked_users_count += 1
+                    long_i = long_int[i_user]
+                    gru_long_i = gru_long_int[i_user] 
+                    out_i = gru_slices[i_user]     
+                    short_i = short_slices[i_user]     
+                    
+                    T = out_i.size(0)
+                    logits_each = torch.zeros(T, device=device)
+
+                    for j in range(T):
+                        c1 = F.cosine_similarity(long_i.unsqueeze(0), out_i[j].unsqueeze(0), dim=-1)
+                        c2 = F.cosine_similarity(gru_long_i.unsqueeze(0), short_i[j].unsqueeze(0), dim=-1)
+                        c3 = F.cosine_similarity(out_i[j].unsqueeze(0), short_i[j].unsqueeze(0), dim=-1)
+                        logits_each[j] =  c1 + c2 + c3
+
+                    mask_probs = gumbel_sigmoid(logits_each, tau=1.0, hard=True)  
+
+                    if user_id not in user_mask_probs:
+                        user_mask_probs[user_id] = []
+
+                    user_mask_probs[user_id].append(mask_probs.cpu().detach().numpy().tolist())
+
+                    denoised_out_i = out_i * mask_probs.unsqueeze(-1)
+                    recon_i = model.decoder(denoised_out_i)
+
+                    if user_id_str not in epoch_mask_probs:
+                        epoch_mask_probs[user_id_str] = mask_probs.detach()
+                    mask_probs_dict = epoch_mask_probs 
+
+                    valid_indices = torch.arange(inputs.size(1) - T, inputs.size(1), device=device)
+                    target_emb = inputs_embedded[i_user].index_select(0, valid_indices)
+                    mse_i = F.mse_loss(recon_i, target_emb)
+                    mse_loss_total += mse_i
+
+            if masked_users_count > 0:
+                mse_loss_total = mse_loss_total / masked_users_count
+            loss = loss + mse_loss_total
+
+            loss.backward()
+            optimizer.step()
+
+            print(f"Loss at this step: {loss.item():.4f}, Masked users: {masked_users_count}/{inputs.size(0)}")
+            losses.append(loss.item())
+            total_loss += loss.item()
+            
+        denoised_sequences = epoch_mask_probs
+
+        avg_loss = total_loss / len(dataloader)
+        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.4f}")
+
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            no_improvement_epochs = 0
+            savefile = "XXX"
+            torch.save(model.state_dict(), savefile)
+            print(f"{savefile} model saved with loss: {best_loss:.4f}")
+
+        else:
+            no_improvement_epochs += 1
+
+        if no_improvement_epochs >= patience:
+            print(f"Early stopping at epoch {epoch+1}. Best loss: {best_loss:.4f}")
+            break
+
+    plt.plot(losses)
+    plt.savefig('XXX')
+    plt.close()
