@@ -33,14 +33,17 @@ Preprocessing: Run the Jupyter Notebook read_data.ipynb to clean and preprocess 
 After preprocessing, run the tointerest.py script to generate semantic embeddings for each item in the dataset using the Large Language Model.
 
 # Example for the Beauty dataset:
+```
 python tointerest.py --dataset Beauty
-
+```
 # Example for the Sports and Outdoors dataset:
+```
 python tointerest.py --dataset Sports_and_Outdoors
-
+```
 To run the baseline models:
+```
 python Gru4Rec.py
-
+```
 Then you can run the GRU_evaluation.py to get the evaluation!
 
 If you find our work helpful to you, please consider citing our paper
