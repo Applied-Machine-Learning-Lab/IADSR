@@ -8,11 +8,12 @@ Please follow the steps below to reproduce the experimental results from our pap
 
 We use the environment with torch 2.5.1, pandas 2.2.3, and numpy 1.23.1. We install [LLM2Vec](https://github.com/McGill-NLP/llm2vec/tree/main) and other dependencies by running the following commands:
 
+```
 cd IADSR
 pip install info-nce-pytorch
 pip install flash-attn --no-build-isolation
 pip install -r requirements.txt
-
+```
 This will set up the environment for rapid reproduction of the results.
 
 2. Data Preparation
